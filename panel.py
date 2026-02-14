@@ -183,6 +183,7 @@ def _safe_parse_request(raw_body: bytes) -> dict:
         "feedback_text": "",
         "has_image": False,
         "image_b64_prefix": "",
+        "image_data_uri": "",
         "sampling": {},
         "messages_count": 0,
         "parse_error": None,
@@ -221,9 +222,11 @@ def _safe_parse_request(raw_body: bytes) -> dict:
                             result["feedback_text"] = str(part.get("text", ""))
                         elif part.get("type") == "image_url":
                             result["has_image"] = True
-                            url = part.get("image_url", {}).get("url", "")
-                            # Store first 80 chars for display
-                            result["image_b64_prefix"] = str(url)[:80] + "..."
+                            url = str(part.get("image_url", {}).get("url", ""))
+                            # Store first 80 chars for log display
+                            result["image_b64_prefix"] = url[:80] + "..."
+                            # Store the FULL data-URI so the dashboard can display it
+                            result["image_data_uri"] = url
             elif isinstance(content, str):
                 result["feedback_text"] = content
 
@@ -399,6 +402,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "sst_text_length": len(req_parsed["sst_text"]),
                 "feedback_text": req_parsed["feedback_text"],
                 "has_image": req_parsed["has_image"],
+                "image_data_uri": req_parsed["image_data_uri"],
                 "sampling": req_parsed["sampling"],
                 "messages_count": req_parsed["messages_count"],
                 "body_size_bytes": len(raw_request),
