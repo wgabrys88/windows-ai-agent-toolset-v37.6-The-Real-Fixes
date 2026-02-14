@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FRANZ Panel — Live Pipeline Monitor</title>
+<style>
+    :root {
+        --bg: #0a0a0f;
+        --bg-card: #12121a;
+        --bg-card-hover: #1a1a25;
+        --border: #2a2a3a;
+        --text: #d0d0e0;
+        --text-dim: #707088;
+        --text-bright: #f0f0ff;
+        --accent: #4a9eff;
+        --accent-dim: #2a5a9a;
+        --green: #40c040;
+        --red: #e04040;
+        --orange: #e0a020;
+        --mono: 'Consolas', 'Courier New', 'Liberation Mono', monospace;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+        background: var(--bg);
+        color: var(--text);
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        font-size: 14px;
+        line-height: 1.5;
+        overflow-x: hidden;
+    }
+
+    /* ── Header ─────────────────────────────────────── */
+
+    .header {
+        position: sticky;
+        top: 0;
+        z-index: 100;
+        background: var(--bg);
+        border-bottom: 1px solid var(--border);
+        padding: 12px 20px;
+        display: flex;
+        align-items: center;
+        gap: 20px;
+    }
+
+    .header h1 {
+        font-size: 18px;
+        font-weight: 700;
+        color: var(--accent);
+        letter-spacing: 2px;
+    }
+
+    .header .status {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        color: var(--text-dim);
+    }
+
+    .header .status .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--red);
+        transition: background 0.3s;
+    }
+
+    .header .status .dot.connected {
+        background: var(--green);
+        box-shadow: 0 0 6px var(--green);
+    }
+
+    .header .stats {
+        margin-left: auto;
+        display: flex;
+        gap: 16px;
+        font-size: 12px;
+        color: var(--text-dim);
+        font-family: var(--mono);
+    }
+
+    .header .stats span { color: var(--text); }
+
+    /* ── Controls ────────────────────────────────────── */
+
+    .controls {
+        padding: 8px 20px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        font-size: 12px;
+    }
+
+    .controls label {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        color: var(--text-dim);
+        cursor: pointer;
+        user-select: none;
+    }
+
+    .controls input[type="checkbox"] {
+        accent-color: var(--accent);
+    }
+
+    .controls button {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        color: var(--text);
+        padding: 4px 12px;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 12px;
+    }
+
+    .controls button:hover {
+        background: var(--bg-card-hover);
+        border-color: var(--accent-dim);
+    }
+
+    /* ── Turn list ───────────────────────────────────── */
+
+    .turn-list {
+        padding: 12px 20px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+    }
+
+    /* ── Turn card ───────────────────────────────────── */
+
+    .turn-card {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        overflow: hidden;
+        transition: border-color 0.2s;
+    }
+
+    .turn-card:hover {
+        border-color: var(--accent-dim);
+    }
+
+    .turn-card.sst-violation {
+        border-color: var(--red);
+        box-shadow: 0 0 12px rgba(224, 64, 64, 0.15);
+    }
+
+    .turn-header {
+        padding: 10px 16px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        border-bottom: 1px solid var(--border);
+        cursor: pointer;
+        user-select: none;
+    }
+
+    .turn-header:hover {
+        background: var(--bg-card-hover);
+    }
+
+    .turn-num {
+        font-family: var(--mono);
+        font-size: 13px;
+        font-weight: 700;
+        color: var(--accent);
+        min-width: 60px;
+    }
+
+    .turn-meta {
+        display: flex;
+        gap: 16px;
+        font-size: 12px;
+        color: var(--text-dim);
+        font-family: var(--mono);
+    }
+
+    .turn-meta .val { color: var(--text); }
+
+    .sst-badge {
+        padding: 2px 8px;
+        border-radius: 3px;
+        font-size: 11px;
+        font-weight: 600;
+        font-family: var(--mono);
+    }
+
+    .sst-badge.ok {
+        background: rgba(64, 192, 64, 0.15);
+        color: var(--green);
+    }
+
+    .sst-badge.fail {
+        background: rgba(224, 64, 64, 0.15);
+        color: var(--red);
+    }
+
+    .sst-badge.unknown {
+        background: rgba(224, 160, 32, 0.15);
+        color: var(--orange);
+    }
+
+    .turn-expand {
+        margin-left: auto;
+        color: var(--text-dim);
+        font-size: 16px;
+        transition: transform 0.2s;
+    }
+
+    .turn-card.expanded .turn-expand {
+        transform: rotate(90deg);
+    }
+
+    /* ── Turn body (collapsible) ─────────────────────── */
+
+    .turn-body {
+        display: none;
+        padding: 0 16px 16px;
+    }
+
+    .turn-card.expanded .turn-body {
+        display: block;
+    }
+
+    .section {
+        margin-top: 12px;
+    }
+
+    .section-title {
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        color: var(--text-dim);
+        margin-bottom: 6px;
+        padding-bottom: 4px;
+        border-bottom: 1px solid var(--border);
+    }
+
+    .section-title.sst { color: var(--accent); }
+    .section-title.feedback { color: var(--orange); }
+    .section-title.vlm { color: var(--green); }
+    .section-title.sst-check { color: var(--red); }
+
+    .text-block {
+        background: #08080e;
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 10px 12px;
+        font-family: var(--mono);
+        font-size: 12px;
+        line-height: 1.6;
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 300px;
+        overflow-y: auto;
+        color: var(--text);
+    }
+
+    .text-block.empty {
+        color: var(--text-dim);
+        font-style: italic;
+    }
+
+    .text-block.sst-mismatch {
+        border-color: var(--red);
+        background: rgba(224, 64, 64, 0.05);
+    }
+
+    .meta-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+        gap: 6px 16px;
+        font-size: 12px;
+        font-family: var(--mono);
+    }
+
+    .meta-grid .key { color: var(--text-dim); }
+    .meta-grid .val { color: var(--text); }
+
+    /* ── Scrollbar ────────────────────────────────────── */
+
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+
+    /* ── Empty state ──────────────────────────────────── */
+
+    .empty-state {
+        text-align: center;
+        padding: 60px 20px;
+        color: var(--text-dim);
+    }
+
+    .empty-state h2 {
+        font-size: 20px;
+        margin-bottom: 8px;
+        color: var(--text);
+    }
+
+    .empty-state p {
+        font-size: 13px;
+    }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+    <h1>FRANZ PANEL</h1>
+    <div class="status">
+        <div class="dot" id="connDot"></div>
+        <span id="connText">Disconnected</span>
+    </div>
+    <div class="stats">
+        Turns: <span id="statTurns">0</span> &nbsp;|&nbsp;
+        Avg latency: <span id="statLatency">—</span> &nbsp;|&nbsp;
+        SST violations: <span id="statViolations">0</span>
+    </div>
+</div>
+
+<!-- Controls -->
+<div class="controls">
+    <label>
+        <input type="checkbox" id="chkAutoExpand">
+        Auto-expand latest
+    </label>
+    <label>
+        <input type="checkbox" id="chkAutoScroll" checked>
+        Auto-scroll
+    </label>
+    <label>
+        <input type="checkbox" id="chkNewestFirst" checked>
+        Newest first
+    </label>
+    <button id="btnClear">Clear display</button>
+</div>
+
+<!-- Turn list -->
+<div class="turn-list" id="turnList">
+    <div class="empty-state" id="emptyState">
+        <h2>Waiting for pipeline traffic…</h2>
+        <p>Start main.py to see turns appear here in real time.</p>
+        <p style="margin-top:8px; font-family: var(--mono); font-size: 11px; color: var(--text-dim);">
+            Proxy: 127.0.0.1:1234 → upstream VLM: 127.0.0.1:1235
+        </p>
+    </div>
+</div>
+
+<script>
+(function() {
+    "use strict";
+
+    // ── State ───────────────────────────────────────
+    let turns = [];
+    let totalLatency = 0;
+    let violationCount = 0;
+    let eventSource = null;
+
+    // ── DOM refs ────────────────────────────────────
+    const connDot = document.getElementById("connDot");
+    const connText = document.getElementById("connText");
+    const statTurns = document.getElementById("statTurns");
+    const statLatency = document.getElementById("statLatency");
+    const statViolations = document.getElementById("statViolations");
+    const turnList = document.getElementById("turnList");
+    const emptyState = document.getElementById("emptyState");
+    const chkAutoExpand = document.getElementById("chkAutoExpand");
+    const chkAutoScroll = document.getElementById("chkAutoScroll");
+    const chkNewestFirst = document.getElementById("chkNewestFirst");
+    const btnClear = document.getElementById("btnClear");
+
+    // ── Helpers ─────────────────────────────────────
+
+    function esc(s) {
+        if (!s) return "";
+        return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    }
+
+    function truncate(s, max) {
+        if (!s || s.length <= max) return s || "";
+        return s.substring(0, max) + "… (" + s.length + " chars total)";
+    }
+
+    function updateStats() {
+        statTurns.textContent = turns.length;
+        if (turns.length > 0) {
+            statLatency.textContent = Math.round(totalLatency / turns.length) + "ms";
+        }
+        statViolations.textContent = violationCount;
+        if (violationCount > 0) {
+            statViolations.style.color = "#e04040";
+        }
+    }
+
+    // ── Render a turn card ──────────────────────────
+
+    function renderTurn(entry, autoExpand) {
+        const t = entry.turn || 0;
+        const lat = entry.latency_ms || 0;
+        const req = entry.request || {};
+        const resp = entry.response || {};
+        const sst = entry.sst_check || {};
+
+        const isViolation = sst.verified && !sst.match;
+        const sstClass = !sst.verified ? "unknown" : (sst.match ? "ok" : "fail");
+        const sstLabel = !sst.verified ? "SST ?" : (sst.match ? "SST ✓" : "SST ✗");
+
+        const card = document.createElement("div");
+        card.className = "turn-card" + (isViolation ? " sst-violation" : "") + (autoExpand ? " expanded" : "");
+        card.dataset.turn = t;
+
+        // Header
+        const hdr = document.createElement("div");
+        hdr.className = "turn-header";
+        hdr.innerHTML = `
+            <span class="turn-num">Turn ${t}</span>
+            <div class="turn-meta">
+                <span>latency: <span class="val">${Math.round(lat)}ms</span></span>
+                <span>status: <span class="val">${resp.status || "?"}</span></span>
+                <span>vlm: <span class="val">${resp.vlm_text_length || 0} chars</span></span>
+                <span>finish: <span class="val">${esc(resp.finish_reason) || "?"}</span></span>
+            </div>
+            <span class="sst-badge ${sstClass}">${sstLabel}</span>
+            <span class="turn-expand">▶</span>
+        `;
+        hdr.addEventListener("click", function() {
+            card.classList.toggle("expanded");
+        });
+
+        // Body
+        const body = document.createElement("div");
+        body.className = "turn-body";
+
+        // SST section
+        const sstText = req.sst_text || "";
+        body.innerHTML += `
+            <div class="section">
+                <div class="section-title sst">SST — User Message #1 (${req.sst_text_length || 0} chars)</div>
+                <div class="text-block ${sstText ? "" : "empty"}">${sstText ? esc(sstText) : "(empty)"}</div>
+            </div>
+        `;
+
+        // Feedback section
+        const fbText = req.feedback_text || "";
+        body.innerHTML += `
+            <div class="section">
+                <div class="section-title feedback">Feedback — User Message #2</div>
+                <div class="text-block ${fbText ? "" : "empty"}">${fbText ? esc(fbText) : "(empty)"}</div>
+            </div>
+        `;
+
+        // VLM response section
+        const vlmText = resp.vlm_text || "";
+        body.innerHTML += `
+            <div class="section">
+                <div class="section-title vlm">VLM Response → becomes next SST</div>
+                <div class="text-block ${vlmText ? "" : "empty"}">${vlmText ? esc(vlmText) : "(empty)"}</div>
+            </div>
+        `;
+
+        // SST check detail
+        if (sst.detail) {
+            body.innerHTML += `
+                <div class="section">
+                    <div class="section-title sst-check">SST Verification</div>
+                    <div class="text-block ${isViolation ? "sst-mismatch" : ""}">${esc(sst.detail)}</div>
+                </div>
+            `;
+        }
+
+        // Metadata
+        const sampling = req.sampling || {};
+        const usage = resp.usage || {};
+        body.innerHTML += `
+            <div class="section">
+                <div class="section-title">Metadata</div>
+                <div class="meta-grid">
+                    <div><span class="key">model:</span> <span class="val">${esc(req.model)}</span></div>
+                    <div><span class="key">temperature:</span> <span class="val">${sampling.temperature ?? "?"}</span></div>
+                    <div><span class="key">top_p:</span> <span class="val">${sampling.top_p ?? "?"}</span></div>
+                    <div><span class="key">max_tokens:</span> <span class="val">${sampling.max_tokens ?? "?"}</span></div>
+                    <div><span class="key">request_size:</span> <span class="val">${req.body_size_bytes || "?"} bytes</span></div>
+                    <div><span class="key">response_size:</span> <span class="val">${resp.body_size_bytes || "?"} bytes</span></div>
+                    <div><span class="key">has_image:</span> <span class="val">${req.has_image ? "yes" : "no"}</span></div>
+                    <div><span class="key">prompt_tokens:</span> <span class="val">${usage.prompt_tokens ?? "?"}</span></div>
+                    <div><span class="key">completion_tokens:</span> <span class="val">${usage.completion_tokens ?? "?"}</span></div>
+                    <div><span class="key">timestamp:</span> <span class="val">${esc(entry.timestamp || "")}</span></div>
+                </div>
+            </div>
+        `;
+
+        // Error
+        if (resp.error) {
+            body.innerHTML += `
+                <div class="section">
+                    <div class="section-title" style="color:var(--red)">Error</div>
+                    <div class="text-block sst-mismatch">${esc(resp.error)}</div>
+                </div>
+            `;
+        }
+
+        card.appendChild(hdr);
+        card.appendChild(body);
+        return card;
+    }
+
+    // ── Insert turn into DOM ────────────────────────
+
+    function addTurn(entry) {
+        emptyState.style.display = "none";
+
+        const autoExpand = chkAutoExpand.checked;
+        const card = renderTurn(entry, autoExpand);
+
+        // Collapse previous latest if auto-expand is on
+        if (autoExpand) {
+            const existing = turnList.querySelectorAll(".turn-card.expanded");
+            existing.forEach(function(el) {
+                if (el !== card) el.classList.remove("expanded");
+            });
+        }
+
+        if (chkNewestFirst.checked) {
+            // Insert after emptyState (which is first child)
+            if (turnList.children.length > 1) {
+                turnList.insertBefore(card, turnList.children[1]);
+            } else {
+                turnList.appendChild(card);
+            }
+        } else {
+            turnList.appendChild(card);
+        }
+
+        if (chkAutoScroll.checked) {
+            if (chkNewestFirst.checked) {
+                window.scrollTo({top: 0, behavior: "smooth"});
+            } else {
+                card.scrollIntoView({behavior: "smooth", block: "end"});
+            }
+        }
+    }
+
+    // ── SSE Connection ──────────────────────────────
+
+    function connect() {
+        if (eventSource) {
+            eventSource.close();
+        }
+
+        eventSource = new EventSource("/events");
+
+        eventSource.onopen = function() {
+            connDot.classList.add("connected");
+            connText.textContent = "Connected";
+        };
+
+        eventSource.onmessage = function(evt) {
+            try {
+                const data = JSON.parse(evt.data);
+
+                if (data.type === "connected") {
+                    // Initial handshake
+                    return;
+                }
+
+                // It's a turn entry
+                turns.push(data);
+                totalLatency += (data.latency_ms || 0);
+
+                const sst = data.sst_check || {};
+                if (sst.verified && !sst.match) {
+                    violationCount++;
+                }
+
+                updateStats();
+                addTurn(data);
+
+            } catch(e) {
+                console.warn("SSE parse error:", e, evt.data);
+            }
+        };
+
+        eventSource.onerror = function() {
+            connDot.classList.remove("connected");
+            connText.textContent = "Reconnecting…";
+            // EventSource auto-reconnects
+        };
+    }
+
+    // ── Controls ────────────────────────────────────
+
+    btnClear.addEventListener("click", function() {
+        turns = [];
+        totalLatency = 0;
+        violationCount = 0;
+        updateStats();
+
+        // Remove all turn cards
+        const cards = turnList.querySelectorAll(".turn-card");
+        cards.forEach(function(c) { c.remove(); });
+        emptyState.style.display = "block";
+    });
+
+    // ── Init ────────────────────────────────────────
+
+    connect();
+
+})();
+</script>
+</body>
+</html>
