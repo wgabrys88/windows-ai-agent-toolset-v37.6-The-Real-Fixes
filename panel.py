@@ -28,12 +28,17 @@ WHAT THIS FILE DOES:
        text to the previous response's content. Logs a WARNING if they differ.
     8. Pushes the parsed turn data to all connected SSE clients for live display.
     9. Writes per-turn JSON logs to panel_log/ directory.
+   10. Extracts the FULL base64 image data URI from the request payload and
+       includes it in the SSE broadcast, enabling the dashboard to render a
+       live screenshot of every frame the pipeline sends to the VLM.
 
 TRANSPARENCY GUARANTEE:
     panel.py NEVER modifies the bytes flowing through it. It reads copies
     for inspection. The main.py ↔ VLM channel is byte-identical with or
     without panel.py in the path. Removing panel.py and pointing main.py
-    directly at the VLM produces IDENTICAL behavior.
+    directly at the VLM produces IDENTICAL behavior. The image data URI is
+    only extracted and forwarded on the observation side-channel (SSE) —
+    the proxy payload is never touched.
 
 SST VERIFICATION:
     panel.py is the ONLY component that can verify SST from OUTSIDE the
@@ -41,6 +46,16 @@ SST VERIFICATION:
     it to messages[1].text in the request for turn N+1. If they differ,
     it logs a SST VIOLATION warning. This is a READ-ONLY check — the
     request is still forwarded unchanged.
+
+LIVE SCREENSHOT DISPLAY:
+    When the request payload contains an image_url part with a base64 data
+    URI (e.g. "data:image/png;base64,…"), panel.py captures the FULL URI
+    in the field "image_data_uri" and includes it in both the per-turn
+    JSON log and the SSE event broadcast. The dashboard (panel.html)
+    renders this data URI directly as an <img> element, providing a real-
+    time visual feed of every screenshot flowing through the pipeline.
+    This is purely observational — the image bytes in transit are never
+    altered.
 
 FILES:
     panel.py        — this file (Python HTTP server + proxy + SSE)
@@ -55,6 +70,7 @@ RUNTIME:
     - Windows 11, Python 3.13+
     - Stdlib only (http.server, urllib, json, threading)
 """
+
 
 import http.server
 import json
@@ -585,3 +601,4 @@ if __name__ == "__main__":
     except Exception:
         traceback.print_exc()
         sys.exit(1)
+
