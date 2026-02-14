@@ -285,6 +285,39 @@
     .meta-grid .key { color: var(--text-dim); }
     .meta-grid .val { color: var(--text); }
 
+    /* ── Screenshot section ───────────────────────── */
+
+    .section-title.screenshot { color: #c080ff; }
+
+    .screenshot-container {
+        background: #08080e;
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 10px 12px;
+        text-align: center;
+        overflow: hidden;
+    }
+
+    .screenshot-container img {
+        max-width: 100%;
+        height: auto;
+        border-radius: 4px;
+        image-rendering: auto;
+        cursor: pointer;
+        transition: opacity 0.2s;
+    }
+
+    .screenshot-container img:hover {
+        opacity: 0.85;
+    }
+
+    .screenshot-container .img-meta {
+        margin-top: 6px;
+        font-family: var(--mono);
+        font-size: 11px;
+        color: var(--text-dim);
+    }
+
     /* ── Scrollbar ────────────────────────────────────── */
 
     ::-webkit-scrollbar { width: 6px; height: 6px; }
@@ -457,6 +490,33 @@
                 <div class="text-block ${fbText ? "" : "empty"}">${fbText ? esc(fbText) : "(empty)"}</div>
             </div>
         `;
+
+        // Screenshot section
+        const imageDataUri = req.image_data_uri || "";
+        if (req.has_image && imageDataUri) {
+            // Estimate base64 payload size (strip data:...;base64, prefix)
+            const b64Start = imageDataUri.indexOf(",");
+            const b64Length = b64Start >= 0 ? imageDataUri.length - b64Start - 1 : imageDataUri.length;
+            const approxKB = Math.round((b64Length * 3 / 4) / 1024);
+            body.innerHTML += `
+                <div class="section">
+                    <div class="section-title screenshot">Screenshot — Live Pipeline Image</div>
+                    <div class="screenshot-container">
+                        <img src="${imageDataUri}" alt="Turn ${t} screenshot"
+                             title="Click to open in new tab"
+                             onclick="window.open(this.src, '_blank')">
+                        <div class="img-meta">~${approxKB} KB</div>
+                    </div>
+                </div>
+            `;
+        } else if (req.has_image && !imageDataUri) {
+            body.innerHTML += `
+                <div class="section">
+                    <div class="section-title screenshot">Screenshot</div>
+                    <div class="text-block empty">(image present but data URI not captured)</div>
+                </div>
+            `;
+        }
 
         // VLM response section
         const vlmText = resp.vlm_text || "";
