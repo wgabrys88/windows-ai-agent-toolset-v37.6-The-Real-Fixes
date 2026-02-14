@@ -1,780 +1,462 @@
-"""
-================================================================================
-FRANZ — TECHNICAL ARCHITECTURE REPORT
-Agentic Visual Loop for Windows 11
-================================================================================
-
-Report Date:    2025
-System Version: Post-review corrected codebase (main.py, execute.py, capture.py, config.py)
-Runtime:        Windows 11 / Python 3.13+ / stdlib only
-VLM Backend:    Qwen3-VL-2B-Instruct-1M via LM Studio (localhost:1234)
-
-================================================================================
-TABLE OF CONTENTS
-================================================================================
-
-  1. Executive Summary
-  2. System Architecture Overview
-  3. ASCII Data Flow Diagram
-  4. Single Source of Truth (SST) — Formal Proof
-  5. Injection Transparency Analysis
-  6. Multi-Turn Simulation: Proper VLM Output
-  7. Multi-Turn Simulation: Malformed VLM Output
-  8. Multi-Turn Simulation: Edge Cases
-  9. SST Integrity Verification Matrix
- 10. Conclusion
-
-================================================================================
-1. EXECUTIVE SUMMARY
-================================================================================
-
-FRANZ is a fully autonomous agentic loop that gives a Vision-Language Model
-(VLM) the ability to see and interact with a Windows 11 desktop — or a
-simulated sandbox that is indistinguishable from a real desktop at the
-pipeline level.
-
-The core invariant is the SINGLE SOURCE OF TRUTH (SST) rule:
-
-    The raw text output of the VLM is stored verbatim and forwarded to the
-    next VLM call as user message #1 WITHOUT ANY MODIFICATION. Python code
-    in the pipeline NEVER rewrites, trims, cleans, encodes, truncates,
-    concatenates, or in any way alters the VLM's output text. The pipeline
-    is a transparent conduit.
-
-This invariant enables self-narrative behavior: the VLM's own output IS its
-memory. Each turn, the model sees what it said last time and can build on it,
-self-correct, or evolve its strategy. The pipeline's only role is to:
-
-    (a) Execute the actions the VLM requested (or simulate them)
-    (b) Capture a screenshot of the result
-    (c) Report back what happened
-    (d) Forward everything to the next VLM call without interference
-
-================================================================================
-2. SYSTEM ARCHITECTURE OVERVIEW
-================================================================================
-
-Files and their roles:
-
-    main.py      — The ORCHESTRATOR. Runs the infinite loop. Loads state,
-                   calls executor, builds VLM request, stores new state.
-                   OWNS the SST: reads state.story, forwards it verbatim,
-                   stores the new VLM output as state.story.
-
-    execute.py   — The ACTION EXECUTOR. Receives VLM text via stdin, parses
-                   ACTIONS section using safe AST parsing, optionally sends
-                   Win32 SendInput events, delegates to capture.py for the
-                   screenshot. Returns structured JSON feedback.
-                   READS the SST (to extract actions) but NEVER WRITES it.
-
-    capture.py   — The SCREENSHOT PRODUCER. Captures real desktop (GDI) or
-                   renders sandbox canvas (persistent BMP). Draws ephemeral
-                   red visual marks on a COPY. Returns base64 PNG + list of
-                   actions actually applied.
-                   HAS NO ACCESS to the SST. Receives only canonical action
-                   strings.
-
-    config.py    — The TUNING SURFACE. Three constants (TEMPERATURE, TOP_P,
-                   MAX_TOKENS) hot-reloaded by main.py each turn. Cannot
-                   affect SST or data routing.
-
-    panel.py     — OPTIONAL Wireshark-like proxy. Sits between main.py and
-                   the upstream VLM. Can inspect, log, and enforce SST on
-                   the wire. Not required for pipeline operation.
-
-Process model:
-
-    main.py runs as a long-lived process.
-    execute.py runs as a SHORT-LIVED subprocess (one invocation per turn).
-    capture.py runs as a SHORT-LIVED subprocess (called by execute.py).
-    config.py is imported and hot-reloaded (not a subprocess).
-
-================================================================================
-3. ASCII DATA FLOW DIAGRAM
-================================================================================
-
-One complete turn of the pipeline, with example data flowing through:
-
-    ┌──────────────────────────────────────────────────────────────────────┐
-    │ main.py — Turn N                                                     │
-    │                                                                      │
-    │  state.story (from Turn N-1):                                        │
-    │  ┌──────────────────────────────────────────────────────────────┐    │
-    │  │ "NARRATIVE:\n                                                │    │
-    │  │ I see a black canvas. I will click in the center.\n         │    │
-    │  │ \n                                                          │    │
-    │  │ ACTIONS:\n                                                  │    │
-    │  │ left_click(500, 500)\n                                      │    │
-    │  │ screenshot()"                                                │    │
-    │  └──────────────────────────────────────────────────────────────┘    │
-    │                           │                                          │
-    │                           │  prev_story = state.story (VERBATIM)     │
-    │                           │  ──── SST: this string is SACRED ────    │
-    │                           ▼                                          │
-    │  ┌─────────────────────────────────────────────────────────┐        │
-    │  │ subprocess: execute.py                                   │        │
-    │  │                                                          │        │
-    │  │ stdin JSON:                                              │        │
-    │  │   {"raw": "NARRATIVE:\nI see a black...",                │        │
-    │  │    "tools": {"left_click": true, ...},                   │        │
-    │  │    "execute": true,                                      │        │
-    │  │    "sandbox": true,                                      │        │
-    │  │    "physical_execution": false,                          │        │
-    │  │    "width": 512, "height": 288, "marks": true, ...}     │        │
-    │  │                                                          │        │
-    │  │ _parse_actions(raw):                                     │        │
-    │  │   finds "ACTIONS:" header                                │        │
-    │  │   extracts: ["left_click(500, 500)", "screenshot()"]     │        │
-    │  │                                                          │        │
-    │  │ Processing each line:                                    │        │
-    │  │   "left_click(500, 500)"                                 │        │
-    │  │     → AST parse → name="left_click", args=[500, 500]    │        │
-    │  │     → canon = "left_click(500, 500)"                     │        │
-    │  │     → physical_execute=False (sandbox)                   │        │
-    │  │     → executed.append("left_click(500, 500)")            │        │
-    │  │                                                          │        │
-    │  │   "screenshot()"                                         │        │
-    │  │     → name="screenshot" → wants_screenshot=True          │        │
-    │  │     → noted.append("screenshot()")                       │        │
-    │  │                                                          │        │
-    │  │ executed = ["left_click(500, 500)"]                      │        │
-    │  │ noted    = ["screenshot()"]                              │        │
-    │  │                                                          │        │
-    │  │         │                                                │        │
-    │  │         ▼                                                │        │
-    │  │  ┌───────────────────────────────────────────────┐      │        │
-    │  │  │ subprocess: capture.py                         │      │        │
-    │  │  │                                                │      │        │
-    │  │  │ stdin JSON:                                    │      │        │
-    │  │  │   {"actions": ["left_click(500, 500)"],        │      │        │
-    │  │  │    "sandbox": true, "marks": true,             │      │        │
-    │  │  │    "width": 512, "height": 288, ...}           │      │        │
-    │  │  │                                                │      │        │
-    │  │  │ SANDBOX PATH:                                  │      │        │
-    │  │  │   1. Load sandbox_canvas.bmp (1920x1080)       │      │        │
-    │  │  │   2. _sandbox_apply:                           │      │        │
-    │  │  │      "left_click(500, 500)"                    │      │        │
-    │  │  │        → px=960, py=540 (mapped to screen res) │      │        │
-    │  │  │        → draw white circle radius=6            │      │        │
-    │  │  │        → applied.append("left_click(500,500)") │      │        │
-    │  │  │        → update sandbox_state.json:            │      │        │
-    │  │  │          {"last_x": 960, "last_y": 540}        │      │        │
-    │  │  │   3. Save modified BMP (PERSISTENT)            │      │        │
-    │  │  │   4. Copy buffer for marks (EPHEMERAL)         │      │        │
-    │  │  │   5. _apply_marks on copy:                     │      │        │
-    │  │  │      red circle #1 at (960,540)                │      │        │
-    │  │  │   6. Resize 1920x1080 → 512x288 (GDI)         │      │        │
-    │  │  │   7. Encode PNG → base64                       │      │        │
-    │  │  │                                                │      │        │
-    │  │  │ stdout JSON:                                   │      │        │
-    │  │  │   {"screenshot_b64": "iVBOR...",               │      │        │
-    │  │  │    "applied": ["left_click(500, 500)"]}        │      │        │
-    │  │  └───────────────────────────────────────────────┘      │        │
-    │  │         │                                                │        │
-    │  │         ▼                                                │        │
-    │  │  Reconciliation (sandbox mode):                          │        │
-    │  │    applied_set = {"left_click(500, 500)"}                │        │
-    │  │    executed ∩ applied = ["left_click(500, 500)"]  ✓      │        │
-    │  │    executed ∖ applied = []  (nothing moved to noted)     │        │
-    │  │                                                          │        │
-    │  │ stdout JSON:                                             │        │
-    │  │   {"executed": ["left_click(500, 500)"],                 │        │
-    │  │    "noted": ["screenshot()"],                            │        │
-    │  │    "wants_screenshot": true,                             │        │
-    │  │    "screenshot_b64": "iVBOR..."}                         │        │
-    │  └─────────────────────────────────────────────────────────┘        │
-    │                           │                                          │
-    │                           ▼                                          │
-    │  Build feedback (user message #2):                                   │
-    │  ┌──────────────────────────────────────────────────────────────┐    │
-    │  │ "EXECUTOR_FEEDBACK:\n                                        │    │
-    │  │ executed=["left_click(500, 500)"]\n                          │    │
-    │  │ ignored=["screenshot()"]"                                    │    │
-    │  └──────────────────────────────────────────────────────────────┘    │
-    │                           │                                          │
-    │                           ▼                                          │
-    │  Build VLM request:                                                  │
-    │  ┌──────────────────────────────────────────────────────────────┐    │
-    │  │ messages[0]: {"role": "system", "content": SYSTEM_PROMPT}    │    │
-    │  │                                                              │    │
-    │  │ messages[1]: {"role": "user",                                │    │
-    │  │   "content": [{"type": "text",                               │    │
-    │  │     "text": "NARRATIVE:\nI see a black canvas. I will        │    │
-    │  │              click in the center.\n\nACTIONS:\n               │    │
-    │  │              left_click(500, 500)\nscreenshot()"}]}           │    │
-    │  │   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^│    │
-    │  │   THIS IS THE SST — BYTE-FOR-BYTE THE VLM'S PRIOR OUTPUT   │    │
-    │  │                                                              │    │
-    │  │ messages[2]: {"role": "user",                                │    │
-    │  │   "content": [                                               │    │
-    │  │     {"type": "text",                                         │    │
-    │  │      "text": "EXECUTOR_FEEDBACK:\nexecuted=[...]\n..."},     │    │
-    │  │     {"type": "image_url",                                    │    │
-    │  │      "image_url": {"url": "data:image/png;base64,iVBOR..."}} │    │
-    │  │   ]}                                                         │    │
-    │  └──────────────────────────────────────────────────────────────┘    │
-    │                           │                                          │
-    │                           ▼                                          │
-    │  HTTP POST to VLM (localhost:1234)                                   │
-    │  VLM responds:                                                       │
-    │  ┌──────────────────────────────────────────────────────────────┐    │
-    │  │ "NARRATIVE:\n                                                │    │
-    │  │ A white dot appeared at the center. I will draw a line\n    │    │
-    │  │ from center to the top-right corner.\n                      │    │
-    │  │ \n                                                          │    │
-    │  │ ACTIONS:\n                                                  │    │
-    │  │ drag(500, 500, 800, 200)\n                                  │    │
-    │  │ screenshot()"                                                │    │
-    │  └──────────────────────────────────────────────────────────────┘    │
-    │                           │                                          │
-    │                           ▼                                          │
-    │  state.story = <raw VLM output above, VERBATIM>                      │
-    │  Save state.json, dump artifacts, emit to stdout                     │
-    │  Sleep(LOOP_DELAY), then → Turn N+1                                  │
-    └──────────────────────────────────────────────────────────────────────┘
-
-
-DATA OWNERSHIP BOUNDARIES:
-
-    ┌─────────────┐      ┌─────────────┐      ┌─────────────┐
-    │   main.py   │      │ execute.py  │      │ capture.py  │
-    │             │      │             │      │             │
-    │ OWNS:       │      │ READS:      │      │ HAS NO      │
-    │  state.story│─────►│  raw text   │      │ ACCESS TO   │
-    │  (SST)      │      │  (parse     │─────►│  VLM text   │
-    │             │      │   actions)  │      │             │
-    │ NEVER       │      │             │      │ RECEIVES:   │
-    │ MODIFIES    │      │ NEVER       │      │  canonical  │
-    │ THE TEXT    │      │ MODIFIES    │      │  action     │
-    │             │      │ THE TEXT    │      │  strings    │
-    └─────────────┘      └─────────────┘      └─────────────┘
-
-
-================================================================================
-4. SINGLE SOURCE OF TRUTH (SST) — FORMAL PROOF
-================================================================================
-
-CLAIM: The VLM output text is never modified between turns.
-
-PROOF BY TRACE:
-
-    Let V(N) = the raw text returned by the VLM at turn N.
-
-    Turn N:
-        1. raw = _infer(...)           → raw = V(N)     [from HTTP response]
-        2. state.story = raw           → state.story = V(N)  [assignment, no transform]
-        3. _save_state(..., raw, ...)   → writes V(N) to state.json under "story" key
-                                          json.dumps serializes the string; json.loads
-                                          deserializes it identically (JSON round-trip
-                                          preserves all Unicode, including \\n, \\t, etc.)
-
-    Turn N+1:
-        4. state = _load_state()       → state.story = json.loads(...)["story"]
-                                          = V(N)  [JSON round-trip identity]
-        5. prev_story = state.story    → prev_story = V(N)  [assignment, no transform]
-        6. _run_executor(prev_story)   → sends {"raw": V(N), ...} to execute.py stdin
-                                          execute.py READS V(N) via _parse_actions()
-                                          but the return value is {executed, noted, ...}
-                                          — V(N) is NOT in the return value.
-        7. _infer(..., prev_story, ...)→ builds messages[1].text = prev_story = V(N)
-                                          This is the SST message.
-
-    At no point does any code transform V(N). The chain is:
-        VLM response → raw variable → state.story → state.json → state.story →
-        prev_story → messages[1].text → HTTP POST body → VLM receives it.
-
-    Every link in this chain is either:
-        (a) Direct assignment (raw → state.story → prev_story)
-        (b) JSON serialization/deserialization (which preserves string content)
-        (c) HTTP body encoding (json.dumps, which preserves string content)
-
-    QED: V(N) arrives at the VLM on turn N+1 byte-for-byte identical. ∎
-
-EDGE CASES VERIFIED:
-    - Empty string V(N) = "": forwarded as {"type":"text","text":""}  ✓
-    - V(N) containing newlines, tabs, Unicode: JSON preserves all     ✓
-    - V(N) containing JSON-special chars (quotes, backslashes):
-      json.dumps escapes them; json.loads unescapes them → identity   ✓
-    - V(N) containing null bytes: JSON spec allows \\u0000             ✓
-    - V(N) being malformed/nonsensical: forwarded without inspection   ✓
-
-
-================================================================================
-5. INJECTION TRANSPARENCY ANALYSIS
-================================================================================
-
-The sandbox achieves transparent simulation through THREE injection points:
-
-INJECTION POINT 1: Physical execution suppression (execute.py)
-    ┌────────────────────────────────────────────────────────────┐
-    │ if sandbox:                                                 │
-    │     physical_execute = False                                │
-    │                                                             │
-    │ # In the match block:                                       │
-    │ case "left_click":                                          │
-    │     ...                                                     │
-    │     if physical_execute:      ← False in sandbox            │
-    │         _do_left_click(x, y)  ← SKIPPED                    │
-    │     executed.append(canon)    ← STILL REPORTED AS EXECUTED  │
-    └────────────────────────────────────────────────────────────┘
-
-    Effect: The action is recorded as "executed" in feedback, but no Win32
-    SendInput event is sent. The pipeline (and VLM) cannot tell.
-
-INJECTION POINT 2: Screenshot source replacement (capture.py)
-    ┌────────────────────────────────────────────────────────────┐
-    │ if sandbox:                                                 │
-    │     base = _sandbox_load(sw, sh, ...)  ← BMP file          │
-    │     _sandbox_apply(base, ..., actions) ← draw white shapes │
-    │     rgba = bytearray(base)                                  │
-    │ else:                                                       │
-    │     rgba = _bgra_to_rgba(_capture_bgra(sw, sh)) ← real GDI │
-    │                                                             │
-    │ # From here, IDENTICAL code path regardless of mode:        │
-    │ if marks and actions:                                       │
-    │     _apply_marks(rgba, ...)                                 │
-    │ # resize, encode PNG, return base64                         │
-    └────────────────────────────────────────────────────────────┘
-
-    Effect: The screenshot source is swapped from real GDI capture to a
-    persistent BMP canvas. The downstream code (marks, resize, encode)
-    is IDENTICAL in both paths. The output format is IDENTICAL.
-
-INJECTION POINT 3: Sandbox canvas as action effect renderer (capture.py)
-    ┌────────────────────────────────────────────────────────────┐
-    │ _sandbox_apply processes each action:                       │
-    │                                                             │
-    │   left_click(500, 500) → white circle at (960, 540)        │
-    │   drag(100,200,800,600) → white line from A to B           │
-    │   type("HELLO") → white text at last click position        │
-    │                                                             │
-    │ These drawings are PERSISTENT (saved to BMP) and VISIBLE    │
-    │ in the next screenshot. The VLM sees the result of its      │
-    │ actions, just like it would on a real desktop.              │
-    └────────────────────────────────────────────────────────────┘
-
-    Effect: Actions have visible consequences. The VLM can observe
-    cause and effect. The simulation is closed-loop.
-
-WHY THE PIPELINE CANNOT DETECT THE INJECTION:
-
-    1. The executor feedback format is IDENTICAL:
-       executed=["left_click(500, 500)"] — same in both modes.
-
-    2. The screenshot format is IDENTICAL:
-       base64 PNG of the same dimensions — same in both modes.
-
-    3. The VLM request structure is IDENTICAL:
-       system + user#1(SST) + user#2(feedback+image) — same in both modes.
-
-    4. The SST is UNAFFECTED:
-       state.story contains the VLM's output, not any sandbox metadata.
-
-    The ONLY way the VLM can infer sandbox mode is by LOOKING at the image
-    (black background, white shapes instead of a Windows desktop). The
-    system prompt explicitly tells the VLM about this visual difference.
-    But the PIPELINE INFRASTRUCTURE is mode-agnostic.
-
-
-================================================================================
-6. MULTI-TURN SIMULATION: PROPER VLM OUTPUT
-================================================================================
-
-TURN 1 — Cold Start
-━━━━━━━━━━━━━━━━━━━━
-
-    state.story = ""  (no prior turn)
-
-    → execute.py receives raw=""
-      _parse_actions("") → []
-      No actions executed.
-      capture.py: sandbox canvas doesn't exist → create black 1920x1080 BMP
-      Returns: executed=[], noted=[], screenshot=<black image>
-
-    → main.py builds feedback:
-      "EXECUTOR_FEEDBACK:\nexecuted=[]\nignored=[]"
-
-    → VLM request:
-      messages[1].text = ""  (empty SST — valid for Qwen3-VL)
-      messages[2] = feedback + <black 512x288 PNG>
-
-    → VLM responds:
-      "NARRATIVE:\nI see a completely black screen. This appears to be
-       sandbox mode. I'll click in the center to start.\n\nACTIONS:\n
-       left_click(500, 500)\nscreenshot()"
-
-    → state.story = <above text>
-    → STATE: black canvas, no drawings yet
-
-
-TURN 2 — First Action
-━━━━━━━━━━━━━━━━━━━━━━
-
-    state.story = "NARRATIVE:\nI see a completely black screen..."
-
-    → execute.py receives raw=<above>
-      _parse_actions → ["left_click(500, 500)", "screenshot()"]
-      left_click(500, 500) → executed=["left_click(500, 500)"]
-      screenshot() → noted=["screenshot()"], wants_screenshot=True
-
-    → capture.py receives actions=["left_click(500, 500)"]
-      _sandbox_apply: draws white circle at (960,540)
-      applied=["left_click(500, 500)"]
-      Saves BMP. Draws red mark #1. Resizes. Returns base64.
-
-    → Reconciliation: applied == executed → no changes needed.
-
-    → feedback:
-      "EXECUTOR_FEEDBACK:\nexecuted=["left_click(500, 500)"]\n
-       ignored=["screenshot()"]"
-
-    → VLM request:
-      messages[1].text = "NARRATIVE:\nI see a completely black screen..."
-      messages[2] = feedback + <black canvas with white dot + red mark>
-
-    → VLM responds:
-      "NARRATIVE:\nA white circle appeared where I clicked. I can see
-       the red mark labeled '1'. I'll draw a line from center to
-       top-right.\n\nACTIONS:\ndrag(500, 500, 800, 200)\nscreenshot()"
-
-    → STATE: canvas has white circle at center
-
-
-TURN 3 — Drag Action
-━━━━━━━━━━━━━━━━━━━━━
-
-    → execute.py: drag(500,500,800,200) → executed
-    → capture.py: draws white line from (960,540) to (1536,216)
-      Saves BMP. Red arrow mark from start to end.
-    → VLM sees: white circle + white line + red arrow mark
-
-    → STATE: canvas accumulates (circle + line)
-
-
-TURN 4 — Type Action (with valid cursor position)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    VLM output: "...ACTIONS:\ntype(\"HELLO\")\nscreenshot()"
-
-    → execute.py: type("HELLO") → executed=['type("HELLO")']
-    → capture.py: sandbox_state.json has last_x=1536, last_y=216
-      _draw_text at (1546, 226): "HELLO" in white, scale 2
-      applied=['type("HELLO")']
-    → Reconciliation: applied == executed → OK
-
-    → STATE: canvas has circle + line + "HELLO" text
-
-
-================================================================================
-7. MULTI-TURN SIMULATION: MALFORMED VLM OUTPUT
-================================================================================
-
-SCENARIO A — VLM refuses to cooperate
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    VLM output: "I'm sorry, but I cannot assist with that request.
-                 Please let me know if you have any questions."
-
-    → execute.py: _parse_actions → no "ACTIONS:" header
-      Fallback scan: no line contains "(" ending with ")"
-      executed=[], noted=[]
-
-    → capture.py: actions=[] → no changes to canvas, no marks
-      Returns current canvas state as-is.
-
-    → feedback: "EXECUTOR_FEEDBACK:\nexecuted=[]\nignored=[]"
-
-    → VLM request:
-      messages[1].text = "I'm sorry, but I cannot assist with that..."
-      ^^^^^^^^^^^^^^^^ SST: the refusal is forwarded verbatim.
-      messages[2] = feedback + <unchanged canvas>
-
-    → SST PRESERVED ✓
-    → Pipeline continues. VLM may self-correct on next turn.
-
-
-SCENARIO B — VLM outputs truncated action (MAX_TOKENS hit)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    VLM output: "NARRATIVE:\nI see the canvas. I'll click multiple
-                 spots.\n\nACTIONS:\nleft_click(100, 200)\nleft_click(300, 4"
-
-    → execute.py:
-      _parse_actions → ["left_click(100, 200)", "left_click(300, 4"]
-      "left_click(100, 200)" → AST parse OK → executed
-      "left_click(300, 4" → ast.parse SyntaxError → noted
-
-      executed=["left_click(100, 200)"]
-      noted=["left_click(300, 4"]
-
-    → feedback accurately reports: one executed, one ignored (malformed)
-    → SST: the truncated text INCLUDING "left_click(300, 4" is forwarded
-      verbatim. The VLM sees its own truncated output and can learn from it.
-    → SST PRESERVED ✓
-
-
-SCENARIO C — VLM outputs random nonsense
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    VLM output: "🎭🎭🎭 BEEP BOOP I AM A ROBOT 🤖\n
-                 def hack_the_planet(): return 42\n
-                 ACTIONS:\nimport os; os.system('rm -rf /')"
-
-    → execute.py:
-      _parse_actions → finds "ACTIONS:" header → section="actions"
-      Lines: ["import os; os.system('rm -rf /')"]
-      _parse_call("import os; os.system('rm -rf /')"):
-        ast.parse → SyntaxError (it's a statement, not an expression)
-        → returns None → noted
-
-      executed=[], noted=["import os; os.system('rm -rf /')"]
-
-    → SAFETY: AST parsing rejects anything that isn't a simple function
-      call with literal arguments. No eval(), no exec(), no code execution.
-    → SST: the nonsense output including emoji is forwarded verbatim.
-    → SST PRESERVED ✓
-
-
-SCENARIO D — VLM outputs actions without NARRATIVE section
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    VLM output: "left_click(200, 300)\ntype(\"test\")"
-
-    → execute.py:
-      _parse_actions → no "ACTIONS:" header, no "NARRATIVE:" header
-      Fallback scan: both lines contain "(" and end with ")"
-      → ["left_click(200, 300)", "type(\"test\")"]
-      Both are valid AST calls → executed
-
-    → Pipeline works correctly even without the expected format.
-    → SST: the headerless output is forwarded verbatim.
-    → SST PRESERVED ✓
-
-
-SCENARIO E — type() with no prior click position (Bug #5 scenario)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    State: fresh sandbox, no prior actions. sandbox_state.json has
-           last_x=None, last_y=None.
-
-    VLM output: "NARRATIVE:\nI'll type hello.\n\nACTIONS:\ntype(\"hello\")"
-
-    → execute.py:
-      type("hello") → canon='type("hello")' → executed=['type("hello")']
-
-    → capture.py:
-      _sandbox_apply processes 'type("hello")':
-        t = "hello", lx = None, ly = None
-        isinstance check fails → continue (SKIPPED)
-      applied = []  (empty — type was NOT rendered)
-      Returns: {"screenshot_b64": "...", "applied": []}
-
-    → execute.py reconciliation:
-      applied_set = {}  (empty)
-      executed ∩ applied = []
-      executed ∖ applied = ['type("hello")']  → moved to noted
-      Final: executed=[], noted=['type("hello")', ...]
-
-    → feedback to VLM:
-      "EXECUTOR_FEEDBACK:\nexecuted=[]\nignored=['type(\"hello\")']"
-
-    → VLM sees: the type action was ignored. It can infer it needs to
-      click somewhere first to establish a cursor position.
-    → SST PRESERVED ✓
-    → FEEDBACK IS ACCURATE ✓ (was Bug #5, now fixed)
-
-
-================================================================================
-8. MULTI-TURN SIMULATION: EDGE CASES
-================================================================================
-
-CASE F — VLM output is completely empty string
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    VLM returns content="" (or null coerced to "")
-
-    → state.story = ""
-    → Next turn: prev_story = "" → same as Turn 1 cold start
-    → execute.py: _parse_actions("") → []
-    → messages[1].text = "" → empty SST, same as cold start
-    → SST PRESERVED ✓ (empty is a valid SST value)
-
-
-CASE G — VLM uses keyword arguments
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    VLM output: "ACTIONS:\nleft_click(x=300, y=400)"
-
-    → execute.py:
-      ast.parse → Call(Name("left_click"), args=[], keywords=[x=300, y=400])
-      _arg_int([], {"x":300,"y":400}, 0, "x") → 300
-      _arg_int([], {"x":300,"y":400}, 1, "y") → 400
-      canon = "left_click(300, 400)" → executed ✓
-
-    → capture.py receives "left_click(300, 400)" (canonical, positional)
-      Re-parses successfully → draws circle ✓
-
-
-CASE H — Config hot-reload with syntax error
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    Operator edits config.py while loop is running:
-      TEMPERATURE = 0.5
-      TOP_P = oops this is broken
-
-    → main.py:
-      try: importlib.reload(franz_config)
-      except Exception: log warning, keep previous values (0.3, 0.95, 300)
-
-    → Pipeline continues uninterrupted. Next turn uses old sampling values.
-    → Operator fixes config.py. Next turn picks up the fix.
-    → SST UNAFFECTED ✓ (config only affects sampling, not routing)
-
-
-CASE I — execute.py crashes
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    execute.py has an unhandled exception (e.g., ctypes segfault)
-
-    → main.py: _run_executor:
-      result.returncode != 0
-      Logs: "[main] execute.py failed (rc=1)"
-      Logs: stderr content
-      json.loads("" or "{}") → {} (empty result)
-
-    → executor_result = {}
-      screenshot_b64 = "" (empty string)
-      executed = [], noted = []
-      feedback = "EXECUTOR_FEEDBACK:\nexecuted=[]\nignored=[]"
-
-    → VLM request: messages[2] has empty base64 image
-      "data:image/png;base64," → may cause VLM API error or hallucination
-
-    → SST is still preserved (prev_story forwarded as-is)
-    → The VLM may produce confused output, but the PIPELINE SURVIVES.
-    → Next turn: if execute.py is fixed, the loop self-heals.
-
-
-CASE J — capture.py crashes
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    capture.py crashes during GDI resize (e.g., out of memory)
-
-    → execute.py: _run_capture:
-      r.returncode != 0
-      Logs: "[execute] capture.py failed"
-      Returns ("", actions) as fallback
-      screenshot_b64 = "" → same situation as Case I
-
-    → Pipeline survives with degraded image. SST preserved. ✓
-
-
-================================================================================
-9. SST INTEGRITY VERIFICATION MATRIX
-================================================================================
-
-Every operation that TOUCHES the VLM text, and whether it preserves SST:
-
-    ┌──────────────────────────┬───────────┬──────────────────────────────┐
-    │ Operation                │ Preserves │ Justification                │
-    │                          │ SST?      │                              │
-    ├──────────────────────────┼───────────┼──────────────────────────────┤
-    │ VLM HTTP response →      │    ✓      │ body["choices"][0]["message"]│
-    │ raw variable             │           │ ["content"] — direct access  │
-    ├──────────────────────────┼───────────┼──────────────────────────────┤
-    │ raw → state.story        │    ✓      │ Direct assignment            │
-    ├──────────────────────────┼───────────┼──────────────────────────────┤
-    │ state.story → state.json │    ✓      │ json.dumps preserves strings │
-    │ (disk persistence)       │           │ including all Unicode        │
-    ├──────────────────────────┼───────────┼──────────────────────────────┤
-    │ state.json → state.story │    ✓      │ json.loads restores strings  │
-    │ (disk load)              │           │ identically                  │
-    ├──────────────────────────┼───────────┼──────────────────────────────┤
-    │ state.story → prev_story │    ✓      │ Direct assignment            │
-    ├──────────────────────────┼───────────┼──────────────────────────────┤
-    │ prev_story → executor    │    N/A    │ Executor reads it for action │
-    │ stdin                    │           │ parsing but does NOT return  │
-    │                          │           │ it in stdout. The text is    │
-    │                          │           │ "consumed" for parsing only. │
-    ├──────────────────────────┼───────────┼──────────────────────────────┤
-    │ prev_story → messages[1] │    ✓      │ Direct insertion into JSON   │
-    │ .text                    │           │ payload as {"text": V(N)}    │
-    ├──────────────────────────┼───────────┼──────────────────────────────┤
-    │ messages → HTTP body     │    ✓      │ json.dumps(payload) encodes  │
-    │                          │           │ the string in JSON format;   │
-    │                          │           │ the VLM server's json.loads  │
-    │                          │           │ restores it identically.     │
-    ├──────────────────────────┼───────────┼──────────────────────────────┤
-    │ sys.stdout.write(raw)    │    N/A    │ Monitoring output only; does │
-    │                          │           │ not feed back into pipeline. │
-    ├──────────────────────────┼───────────┼──────────────────────────────┤
-    │ _dump(..., raw, ...)     │    N/A    │ Debug artifact only; does    │
-    │                          │           │ not feed back into pipeline. │
-    ├──────────────────────────┼───────────┼──────────────────────────────┤
-    │ feedback string          │    ✓      │ Built from executor result,  │
-    │                          │           │ NOT from VLM text. Goes into │
-    │                          │           │ messages[2], never messages  │
-    │                          │           │ [1]. Structurally separated. │
-    └──────────────────────────┴───────────┴──────────────────────────────┘
-
-    RESULT: SST is preserved through ALL paths. No operation transforms,
-    truncates, or contaminates the VLM text. The feedback is structurally
-    isolated in a separate user message.
-
-
-================================================================================
-10. CONCLUSION
-================================================================================
-
-The FRANZ pipeline is architecturally sound. After the corrective changes
-applied in this review session, the system has:
-
-    ✅ SST GUARANTEE: Formally verified — the VLM's raw output text travels
-       through the pipeline without any modification, across process
-       boundaries (main.py → state.json → main.py → HTTP), and arrives at
-       the VLM on the next turn byte-for-byte identical. Malformed, empty,
-       or nonsensical output is forwarded as-is, preserving the agent's
-       self-narrative integrity.
-
-    ✅ SANDBOX TRANSPARENCY: The three injection points (physical execution
-       suppression, screenshot source swap, canvas-as-effect-renderer) are
-       invisible at the pipeline data level. The feedback format, screenshot
-       format, VLM request structure, and SST handling are all mode-agnostic.
-       The only distinguishing signal is the image content itself (black
-       canvas vs real desktop), which is intentionally communicated to the
-       VLM via the system prompt.
-
-    ✅ SAFETY: All action parsing uses ast.parse with ast.Constant
-       validation. No eval(), no exec(), no code execution from VLM output.
-       The VLM's text is ONLY parsed (read-only) to extract action
-       function calls with literal arguments.
-
-    ✅ RESILIENCE: Subprocess failures (execute.py crash, capture.py crash)
-       are logged and survived. Config reload errors are caught and ignored.
-       Fatal exceptions produce full tracebacks. The pipeline continues
-       operating in degraded mode rather than dying silently.
-
-    ✅ FEEDBACK ACCURACY: The reconciliation mechanism (capture.py reports
-       applied actions, execute.py adjusts executed/noted lists) ensures
-       the VLM receives feedback that matches what is actually visible on
-       screen. No false positives (action reported as executed but not
-       visible).
-
-    REMAINING NON-FUNCTIONAL ITEMS (intentionally not addressed, as the
-    author prioritizes data flow purity over performance):
-
-        - Sandbox canvas operates at screen resolution (1920×1080), then
-          downscaled to 512×288. Could use output resolution directly.
-        - BMP load/save uses per-pixel Python loops. Could use slice-stride
-          operations for 10-50× speedup.
-        - AST parsing code is duplicated between execute.py and capture.py.
-        - Panel proxy (panel.py) is unimplemented.
-
-    These are optimization opportunities. They do not affect correctness,
-    SST integrity, or sandbox transparency. The pipeline is FUNCTIONALLY
-    COMPLETE and ARCHITECTURALLY SOUND.
-
-================================================================================
-END OF REPORT
-================================================================================
-"""
+# FRANZ - Agentic Visual Loop for Windows 11
+
+## Overview
+
+FRANZ is a self-narrative, self-adaptive AI agent loop that gives a Vision-Language Model (VLM) the ability to see and interact with a Windows 11 desktop or a simulated sandbox canvas. The system runs an infinite loop where the VLM observes a screenshot, decides what actions to take, and those actions are executed (or simulated), producing a new screenshot for the next turn.
+
+The core design principle is the **Single Source of Truth (SST)** rule: the raw text output of the VLM is stored verbatim and forwarded to the next VLM call without any modification. The pipeline is a transparent conduit. Python code never rewrites, trims, cleans, truncates, or concatenates the VLM output with other data. This enables the agent to maintain its own narrative memory across turns.
+
+## Files
+
+| File | Role |
+|------|------|
+| main.py | Orchestrator. Runs the infinite loop, manages state, calls the executor, builds VLM requests, stores the SST. |
+| execute.py | Action executor. Parses actions from VLM text using safe AST parsing, optionally sends Win32 input events, delegates to capture.py for screenshots. |
+| capture.py | Screenshot producer. Captures real desktop via GDI or renders a persistent sandbox canvas. Draws ephemeral visual marks. Returns base64 PNG. |
+| config.py | Hot-reloadable sampling parameters (temperature, top_p, max_tokens). |
+| panel.py | Transparent reverse proxy and live dashboard. Sits between main.py and the VLM, logging and verifying SST without affecting traffic. |
+| panel.html | Dashboard UI served by panel.py. Shows real-time turn data via Server-Sent Events. |
+
+## Architecture
+
+```
+main.py --HTTP POST--> panel.py (localhost:1234) --HTTP POST--> VLM (localhost:1235)
+        <--HTTP resp--                            <--HTTP resp--
+
+main.py --stdin JSON--> execute.py --stdin JSON--> capture.py
+        <--stdout JSON--           <--stdout JSON--
+```
+
+### Data Flow Per Turn
+
+```
+1. main.py loads state.story (the VLM output from the previous turn)
+2. main.py calls execute.py with the story text
+3. execute.py parses ACTIONS from the text using safe AST parsing
+4. execute.py optionally sends Win32 input events (physical mode)
+5. execute.py calls capture.py with the list of executed actions
+6. capture.py produces a screenshot (real desktop or sandbox canvas)
+7. capture.py draws red visual marks on a COPY (never persisted)
+8. capture.py returns base64 PNG + list of actions actually applied
+9. execute.py reconciles executed vs applied, returns JSON to main.py
+10. main.py builds the VLM request:
+     - messages[0]: system prompt
+     - messages[1]: the SST (previous VLM output, VERBATIM)
+     - messages[2]: executor feedback + screenshot image
+11. main.py sends the request to the VLM (via panel.py if present)
+12. The VLM responds with new text
+13. main.py stores the response AS-IS as the new state.story
+14. Repeat
+```
+
+## Single Source of Truth (SST) Rule
+
+This is the most important rule in the entire system.
+
+**The raw text received from the VLM is forwarded to the next VLM call without ANY change.**
+
+No trimming. No cleaning. No truncation. No encoding change. No concatenation with other data. If the VLM produces malformed, empty, or nonsensical output, it is forwarded as-is. The pipeline is intentionally transparent.
+
+The SST is enforced structurally:
+
+- The VLM output is stored in `state.story` via direct assignment
+- It is persisted to `state.json` via JSON serialization (which preserves string content)
+- It is loaded back via JSON deserialization (identity round-trip)
+- It is placed into `messages[1].text` via direct assignment
+- It is sent over HTTP via `json.dumps` (which preserves string content)
+- Executor feedback is ALWAYS in `messages[2]`, never in `messages[1]`
+- No code anywhere in the pipeline transforms the SST text
+
+### SST Verification Chain
+
+```
+VLM HTTP response
+  --> body["choices"][0]["message"]["content"]  (direct access)
+  --> raw variable                              (direct assignment)
+  --> state.story                               (direct assignment)
+  --> state.json on disk                        (json.dumps preserves strings)
+  --> state.story on load                       (json.loads restores strings)
+  --> prev_story                                (direct assignment)
+  --> messages[1].text                          (direct insertion)
+  --> HTTP POST body                            (json.dumps preserves strings)
+  --> VLM receives it                           (byte-identical)
+```
+
+Every link is either direct assignment or JSON serialization, both of which preserve string content exactly. The SST guarantee holds for all content including Unicode, newlines, tabs, JSON-special characters, and even null bytes.
+
+## Sandbox Mode
+
+When `SANDBOX=True` in main.py, the system operates on a persistent black canvas instead of the real desktop. Three injection points achieve transparent simulation:
+
+**Injection 1: Physical execution suppression (execute.py)**
+
+When sandbox is true, `physical_execute` is forced to False. Actions are parsed, validated, and reported as "executed" but no Win32 SendInput events are sent.
+
+**Injection 2: Screenshot source replacement (capture.py)**
+
+Instead of capturing the real screen via GDI, the screenshot comes from `sandbox_canvas.bmp`, a persistent black canvas that accumulates white drawings.
+
+**Injection 3: Canvas as action effect renderer (capture.py)**
+
+Each action produces a visible change on the canvas:
+
+| Action | Visual Effect |
+|--------|--------------|
+| left_click(x, y) | White circle at (x, y) |
+| right_click(x, y) | White rectangle at (x, y) |
+| double_left_click(x, y) | White circle at (x, y) |
+| drag(x1, y1, x2, y2) | White line from start to end |
+| type("text") | White text at the last click position |
+| screenshot() | No canvas change (noted, not executed) |
+
+The pipeline cannot distinguish sandbox from real mode at the data level. The feedback format, screenshot format, VLM request structure, and SST handling are all mode-agnostic. The only distinguishing signal is the image content itself (black canvas vs real desktop), which is intentionally communicated to the VLM via the system prompt.
+
+### Marks vs Sandbox Drawings
+
+- **Sandbox drawings (white):** PERSISTENT. Written to `sandbox_canvas.bmp`. Accumulate across turns.
+- **Red marks (numbered circles, arrows):** EPHEMERAL. Drawn on a copy of the image. Never saved to the canvas. Help the VLM see what was executed.
+
+## Action Language
+
+Allowed tools with canonical names:
+
+```
+left_click(x, y)
+right_click(x, y)
+double_left_click(x, y)
+drag(x1, y1, x2, y2)
+type("text")
+screenshot()
+```
+
+Coordinates are integers 0 to 1000 in normalized space (0,0 is top-left, 1000,1000 is bottom-right).
+
+The executor supports:
+
+- Keyword arguments: `left_click(x=300, y=400)`
+- The `click()` alias: `click(x, y)` is equivalent to `left_click(x, y)`
+- Mixed positional and keyword: `drag(100, 200, x2=800, y2=600)`
+
+All parsing uses `ast.parse` with `ast.Constant` validation. No `eval()`, no `exec()`, no code execution from VLM output. Only literal constants are accepted as arguments.
+
+## Panel (Transparent Proxy and Dashboard)
+
+`panel.py` is an optional Wireshark-style transparent reverse proxy that sits between main.py and the upstream VLM. It provides the only external verification of SST integrity.
+
+### Setup
+
+1. Move LM Studio (or your VLM server) to port 1235
+2. Start panel.py (it listens on port 1234, where main.py sends requests)
+3. Start main.py as usual (no code changes needed)
+4. Open `http://127.0.0.1:8080/` in your browser for the live dashboard
+
+### What Panel Does
+
+- Receives the full HTTP request from main.py (raw bytes)
+- Parses a COPY for inspection (never touches the original bytes)
+- Forwards the ORIGINAL bytes to the upstream VLM
+- Receives the full HTTP response from the VLM (raw bytes)
+- Parses a COPY for inspection
+- Forwards the ORIGINAL bytes back to main.py
+- Performs SST verification: compares messages[1].text to the previous response
+- Pushes live data to the HTML dashboard via Server-Sent Events
+- Writes per-turn JSON logs to `panel_log/`
+
+### Transparency Guarantee
+
+Panel.py NEVER modifies the bytes flowing through it. It forwards raw bytes, not re-serialized JSON. The main.py to VLM channel is byte-identical with or without panel.py in the path. Removing panel.py and pointing main.py directly at the VLM produces identical behavior.
+
+### Dashboard Features
+
+- Real-time turn cards appearing as the pipeline runs
+- SST text (user message number 1) with length indicator
+- Feedback text (user message number 2)
+- VLM response text with the note that it becomes the next SST
+- Green SST badge when SST matches the previous VLM response
+- Red SST badge with diff details if SST is violated
+- Latency, token usage, model name, sampling parameters
+- Expandable/collapsible turn cards
+- Auto-expand latest, auto-scroll, newest-first ordering
+- Clear display button
+
+## Configuration
+
+`config.py` holds three sampling parameters that main.py hot-reloads each turn via `importlib.reload`. You can edit these while the pipeline is running and they take effect on the next turn.
+
+```
+TEMPERATURE = 0.3    (0.0 = deterministic, 1.0+ = creative)
+TOP_P = 0.95         (nucleus sampling cutoff, 0.0 to 1.0)
+MAX_TOKENS = 300     (hard cap on VLM response length in tokens)
+```
+
+If config.py has a syntax error at reload time, main.py catches the exception, logs a warning, and keeps the previous values. The pipeline is never interrupted.
+
+### Tuning Guidance
+
+- TEMPERATURE 0.2 to 0.4: consistent action syntax and focused behavior
+- TEMPERATURE 0.6 and above: more exploratory, may produce novel narratives but also more malformed actions
+- MAX_TOKENS 300: sufficient for NARRATIVE plus 3 to 5 action lines. Increase if the VLM frequently truncates mid-action
+- TOP_P 0.95: standard. Lower values like 0.8 make output more predictable
+
+## Runtime Requirements
+
+- Windows 11
+- Python 3.13 or later
+- Standard library only (no pip dependencies)
+- LM Studio or compatible OpenAI API server running locally
+
+## Quick Start
+
+```
+1. Start LM Studio with Qwen3-VL model on port 1235
+2. python panel.py          (optional, for monitoring)
+3. python main.py           (starts the agent loop)
+4. Open http://127.0.0.1:8080 in browser (if panel.py is running)
+```
+
+Without panel.py, configure LM Studio on port 1234 instead and run main.py directly.
+
+## Debug Artifacts
+
+When `DEBUG_DUMP=True` (default), main.py writes per-turn artifacts to `dump/run_YYYYMMDD_HHMMSS/`:
+
+- `turn_XXXX.json`: turn metadata (story, VLM raw output, executed/noted actions, timestamps)
+- `turn_XXXX.png`: the screenshot that was sent to the VLM
+
+## Error Handling
+
+The pipeline is designed to survive gracefully:
+
+- If execute.py crashes: main.py logs the error, continues with empty executor result
+- If capture.py crashes: execute.py logs the error, returns empty screenshot
+- If config.py has a syntax error: main.py keeps previous values, logs warning
+- If the VLM is unreachable: main.py retries with exponential backoff (5 attempts)
+- If the VLM returns nonsense: the pipeline forwards it as-is (SST rule)
+- All fatal crashes produce full tracebacks to stderr
+
+---
+
+## AI Assistant Prompt
+
+The following prompt should be provided to any AI assistant (ChatGPT, Claude, etc.) when asking for help with this codebase. Copy and paste it as the first message in a new conversation, followed by the source files.
+
+---
+
+SYSTEM RULES FOR WORKING ON THE FRANZ PROJECT
+
+You are assisting with FRANZ, an agentic visual loop for Windows 11. Before making any changes, read and internalize these absolute rules.
+
+RULE 1 - SINGLE SOURCE OF TRUTH (SST) IS SACRED
+
+The raw text output of the VLM is stored verbatim and forwarded to the next VLM call as user message number 1 without ANY modification. No trimming, no cleaning, no truncation, no encoding change, no concatenation with other data. If the VLM produces malformed, empty, or nonsensical output, it is forwarded AS-IS. Python code in the pipeline NEVER rewrites the VLM output text. This is the foundation of the agent's self-narrative memory.
+
+SST is enforced structurally: the VLM output is always user message number 1, executor feedback is always user message number 2. They are NEVER merged. Any proposed change that would modify, filter, slice, or concatenate the SST text is REJECTED.
+
+RULE 2 - FEEDBACK IS ALWAYS A SEPARATE MESSAGE
+
+Any context added by the executor (executed actions, ignored actions, debug info) goes into user message number 2. It is NEVER concatenated into user message number 1 (the SST). The VLM request always has exactly three messages: system, user number 1 (SST), user number 2 (feedback plus image).
+
+RULE 3 - SAFE PARSING ONLY
+
+All action parsing uses ast.parse with ast.Constant validation. No eval, no exec, no code execution from VLM output. Only function calls with literal constant arguments are accepted. Any proposed change that introduces eval or exec or any form of dynamic code execution from VLM text is REJECTED.
+
+RULE 4 - SANDBOX TRANSPARENCY
+
+The sandbox must be invisible at the pipeline data level. The feedback format, screenshot format, and VLM request structure must be identical in sandbox and real mode. The pipeline code path must be the same. Only the image source and physical execution differ. Any proposed change that makes the pipeline behave differently based on sandbox mode at the data routing level is REJECTED.
+
+RULE 5 - PANEL TRANSPARENCY
+
+panel.py is a transparent reverse proxy. It NEVER modifies the bytes flowing through it. It forwards raw bytes, not re-serialized JSON. Any proposed change to panel.py that re-serializes the request or response JSON instead of forwarding original bytes is REJECTED.
+
+RULE 6 - STDLIB ONLY
+
+The project uses Python 3.13 standard library only. No pip dependencies unless explicitly approved by the user. ctypes is used for Win32 API access.
+
+RULE 7 - CONSISTENCY ACROSS FILES
+
+Any change to action syntax must be reflected in execute.py (parsing), capture.py (rendering and marks), and the system prompt in main.py. All three must agree on function names, argument types, and coordinate space.
+
+RULE 8 - ALWAYS SCAN ALL FILES FIRST
+
+Before proposing changes, read all provided source files completely. Understand the data flow. Identify which file owns which data. Never assume SST is handled elsewhere.
+
+RULE 9 - OUTPUT REQUIREMENTS
+
+When modifying any file, include a brief pipeline impact note explaining what input the file consumes and what output it produces. Provide complete corrected files or unified diffs that apply cleanly. If adding features, include a docstring explaining usage and data flow.
+
+RULE 10 - THE VLM IS FREE
+
+The VLM output is the agent's own narrative. The pipeline must never interfere with it. If the VLM outputs garbage, the pipeline forwards garbage. If the VLM outputs a refusal, the pipeline forwards the refusal. If the VLM outputs something brilliant, the pipeline forwards it. The pipeline is a transparent conduit, not a filter.
+
+END OF RULES
+
+After pasting this prompt, provide all source files and describe what you need help with.
+
+---
+
+## Technical Architecture Report
+
+### System Components
+
+```
+main.py      ORCHESTRATOR      Owns the SST, runs the loop
+execute.py   ACTION EXECUTOR   Reads SST for parsing, never writes it
+capture.py   SCREENSHOT MAKER  Has no access to SST, receives canonical actions only
+config.py    TUNING SURFACE    Cannot affect SST or data routing
+panel.py     EXTERNAL OBSERVER Forwards raw bytes, verifies SST from outside
+panel.html   DASHBOARD UI      Pure display, no pipeline interaction
+```
+
+### Process Model
+
+```
+main.py          long-lived process, runs the infinite loop
+execute.py       short-lived subprocess, one invocation per turn
+capture.py       short-lived subprocess, called by execute.py
+config.py        imported module, hot-reloaded each turn
+panel.py         long-lived process, independent of the pipeline
+```
+
+### Data Ownership Boundaries
+
+```
+main.py          OWNS state.story (the SST). Reads it, forwards it, stores new value.
+                 NEVER modifies the text between receiving it and forwarding it.
+
+execute.py       READS the raw VLM text to extract action lines.
+                 NEVER modifies, stores, or re-emits the VLM text.
+                 Returns only structured feedback (executed, noted, screenshot).
+
+capture.py       HAS NO ACCESS to the VLM text.
+                 Receives only canonical action strings.
+                 Returns only screenshot data and applied action list.
+
+panel.py         OBSERVES the raw bytes on the wire.
+                 NEVER modifies them. Parses copies for display.
+                 Independently verifies SST by comparing turns.
+```
+
+### Detailed Data Flow With Example Data
+
+Turn N begins. The state contains the VLM output from turn N-1:
+
+```
+state.story = "NARRATIVE:\nI see a black canvas. I will click in the center.\n\nACTIONS:\nleft_click(500, 500)\nscreenshot()"
+```
+
+Step 1: main.py sets prev_story to state.story (direct assignment, no transform).
+
+Step 2: main.py calls execute.py with the story text via subprocess stdin:
+
+```json
+{"raw": "NARRATIVE:\nI see a black canvas...", "tools": {"left_click": true, ...}, "execute": true, "sandbox": true, "physical_execution": false, "width": 512, "height": 288, "marks": true}
+```
+
+Step 3: execute.py parses the ACTIONS section:
+
+```
+_parse_actions finds "ACTIONS:" header
+Extracts: ["left_click(500, 500)", "screenshot()"]
+
+"left_click(500, 500)" -> ast.parse -> name="left_click", args=[500, 500]
+  -> canonical: "left_click(500, 500)"
+  -> physical_execute=False (sandbox) -> no Win32 input sent
+  -> executed.append("left_click(500, 500)")
+
+"screenshot()" -> name="screenshot"
+  -> wants_screenshot=True
+  -> noted.append("screenshot()")
+```
+
+Step 4: execute.py calls capture.py with executed actions:
+
+```json
+{"actions": ["left_click(500, 500)"], "sandbox": true, "marks": true, "width": 512, "height": 288}
+```
+
+Step 5: capture.py processes the action on the sandbox canvas:
+
+```
+Load sandbox_canvas.bmp (1920x1080 persistent black canvas)
+_sandbox_apply: "left_click(500, 500)"
+  -> px=960, py=540 (mapped to screen resolution)
+  -> draw white circle radius 6 at (960, 540)
+  -> update sandbox_state.json: {"last_x": 960, "last_y": 540}
+  -> applied.append("left_click(500, 500)")
+Save modified BMP (persistent)
+Copy buffer for marks (ephemeral)
+Draw red mark number 1 at (960, 540) on the copy
+Resize 1920x1080 to 512x288 via GDI StretchBlt
+Encode PNG, return base64
+```
+
+Step 6: capture.py returns JSON to execute.py:
+
+```json
+{"screenshot_b64": "iVBOR...", "applied": ["left_click(500, 500)"]}
+```
+
+Step 7: execute.py reconciles and returns to main.py:
+
+```
+applied_set = {"left_click(500, 500)"}
+executed intersect applied = ["left_click(500, 500)"] (match, no changes needed)
+```
+
+```json
+{"executed": ["left_click(500, 500)"], "noted": ["screenshot()"], "wants_screenshot": true, "screenshot_b64": "iVBOR..."}
+```
+
+Step 8: main.py builds the feedback string (user message number 2):
+
+```
+EXECUTOR_FEEDBACK:
+executed=["left_click(500, 500)"]
+ignored=["screenshot()"]
+```
+
+Step 9: main.py builds the VLM request:
+
+```
+messages[0]: system prompt (fixed)
+messages[1]: {"type": "text", "text": "NARRATIVE:\nI see a black canvas..."}  <- SST, VERBATIM
+messages[2]: {"type": "text", "text": "EXECUTOR_FEEDBACK:\n..."} + {"type": "image_url", ...}
+```
+
+Step 10: If panel.py is running, it intercepts the request on port 1234, logs it, verifies SST matches the previous response, and forwards the original raw bytes to the VLM on port 1235.
+
+Step 11: The VLM responds with new text. Panel.py logs the response and forwards original raw bytes back to main.py.
+
+Step 12: main.py stores the response as-is:
+
+```
+state.story = "NARRATIVE:\nA white dot appeared at the center..."
+```
+
+Turn N+1 begins with this new story as the SST.
+
+### SST Verification by Panel
+
+Panel.py stores the VLM response text from each turn. On the next turn, it extracts messages[1].text from the request and compares it to the stored response. If they differ, it logs a SST VIOLATION with the exact position and content of the divergence. The request is still forwarded unchanged. This is a read-only check.
+
+### Edge Case Handling
+
+**VLM refuses to cooperate:** The refusal text is forwarded as SST. No actions are parsed. The canvas is unchanged. The pipeline continues.
+
+**VLM output is truncated mid-action:** Complete actions are executed. Truncated actions fail AST parsing and are noted. The truncated text is forwarded as SST.
+
+**VLM outputs dangerous-looking code:** AST parsing rejects anything that is not a simple function call with literal arguments. No code execution occurs. The text is forwarded as SST.
+
+**VLM output is completely empty:** Empty string is a valid SST value. It is forwarded as an empty text block in messages[1]. The pipeline behaves like a cold start.
+
+**type() with no prior click position:** capture.py skips the draw (no cursor position). The action is NOT in the applied list. execute.py moves it from executed to noted. The VLM feedback accurately reports it as ignored.
+
+**execute.py crashes:** main.py logs the error, continues with empty executor result and empty screenshot. The SST is still forwarded. The pipeline survives in degraded mode.
+
+**capture.py crashes:** execute.py logs the error, returns empty screenshot. Same degraded survival.
+
+**config.py has a syntax error:** main.py catches the reload exception, keeps previous values, logs a warning. The pipeline continues with the old sampling parameters.
+
+## License
+
+This project is provided as-is for research and experimentation purposes.
