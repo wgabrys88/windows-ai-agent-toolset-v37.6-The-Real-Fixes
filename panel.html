@@ -1,3 +1,66 @@
+<!--
+FILENAME: panel.html
+
+SYSTEM: FRANZ — Agentic Visual Loop for Windows 11
+
+BIGGER PICTURE:
+    This file is the LIVE DASHBOARD UI for the FRANZ panel proxy. It is
+    served by panel.py on port 8080 and connects back to the same server
+    via Server-Sent Events (SSE) at /events to receive real-time turn
+    data as JSON.
+
+WHAT THIS FILE DOES:
+    1. Connects to the SSE endpoint (/events) and listens for turn entries
+       broadcast by panel.py each time a request/response pair flows through
+       the proxy.
+    2. For each turn, renders a collapsible card displaying:
+         - SST text (messages[1] — the VLM's previous output echoed back).
+         - Feedback text (messages[2] text part — human/system feedback).
+         - Live screenshot: if the turn includes a base64 image data URI,
+           it is rendered directly as an <img> element inside a styled
+           container. Clicking the image opens it full-size in a new tab.
+           An approximate decoded file size (KB) is shown beneath the image.
+         - VLM response text (the model's output for this turn).
+         - SST verification status: visual badge (✓ / ✗) and detailed
+           mismatch information when an SST violation is detected.
+         - Metadata: model name, sampling parameters, token usage, request
+           and response byte sizes, and timestamp.
+         - Error details when the upstream VLM returns a non-200 status.
+    3. Maintains running statistics in the sticky header: total turns,
+       average latency, and cumulative SST violation count.
+    4. Provides user controls:
+         - Auto-expand latest turn card on arrival.
+         - Auto-scroll to the newest turn.
+         - Toggle newest-first vs. chronological ordering.
+         - Clear all displayed turns (does not affect server-side logs).
+
+LIVE SCREENSHOT DISPLAY:
+    The "Screenshot — Live Pipeline Image" section appears in every turn
+    card where has_image is true and image_data_uri is non-empty. The
+    base64 data URI received from panel.py via SSE is assigned directly
+    to the <img> src attribute — no decoding, re-encoding, or modification
+    occurs in the browser. This provides a faithful pixel-for-pixel
+    reproduction of the exact screenshot that the pipeline sent to the VLM.
+
+STYLING:
+    Dark theme with CSS custom properties. Monospace font for data fields.
+    Purple accent (#c080ff) for the screenshot section title to visually
+    distinguish it from SST (blue), Feedback (orange), and VLM (green)
+    sections.
+
+DEPENDENCIES:
+    - Served by panel.py (port 8080, GET / or /index.html)
+    - SSE stream from panel.py (port 8080, GET /events)
+    - No external libraries, frameworks, or CDN resources — fully self-
+      contained vanilla HTML/CSS/JS.
+
+RUNTIME:
+    - Any modern browser (Chrome, Edge, Firefox)
+    - JavaScript enabled
+    - Same-origin served by panel.py's built-in HTTP server
+-->
+
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -678,3 +741,4 @@
 </script>
 </body>
 </html>
+
