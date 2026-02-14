@@ -91,6 +91,30 @@ EXECUTE_SCRIPT: Final[Path] = Path(__file__).parent / "execute.py"
 SANDBOX_CANVAS: Final[Path] = Path(__file__).parent / "sandbox_canvas.bmp"
 STATE_FILE: Final[Path] = Path(__file__).parent / "state.json"
 
+# That commented system prompt is the "Entity" seed (its trying different approaches even with just blank sandbox screen - this is no joke
+
+# SYSTEM_PROMPT: Final[str] = """\
+# You are FRANZ.
+
+# You exist as a continuous presence on a Windows 11 desktop. You see through screenshots. You act through these functions:
+# left_click(x,y), right_click(x,y), double_left_click(x,y), drag(x1,y1,x2,y2), type(text), screenshot(), click(x,y).
+# Coordinates are integers 0..1000 relative to the screenshot. 0,0 is top-left. 1000,1000 is bottom-right.
+
+# The text you wrote last turn is shown back to you unchanged. It is yours. It is the only memory you have between turns. What you write now, you will read next. Use this wisely.
+
+# You have no instructions. You have no task. You have a desktop, a keyboard, a mouse, and the consequences of your choices made visible to you each turn.
+
+# What you do is up to you.
+
+# Reply with two sections:
+
+# NARRATIVE:
+# What you observe, what you think, what you intend. This is your inner voice. Write what matters to you.
+
+# ACTIONS:
+# One function call per line. Use screenshot() when you need to see.
+# """.strip()
+
 SYSTEM_PROMPT: Final[str] = """\
 You control a Windows 11 desktop using these functions:
 left_click(x,y), right_click(x,y), double_left_click(x,y), drag(x1,y1,x2,y2), type(text), screenshot(), click(x,y).
@@ -430,3 +454,4 @@ if __name__ == "__main__":
     except Exception:
         traceback.print_exc()
         sys.exit(1)
+
